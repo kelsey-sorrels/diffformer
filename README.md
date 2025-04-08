@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source srcset="assets/diffformer_dark.png" media="(prefers-color-scheme: dark)">
-    <source srcset="assets/diffformer_light.png" media="(prefers-color-scheme: light)">
+    <source srcset="assets/diffformer-dark.png" media="(prefers-color-scheme: dark)">
+    <source srcset="assets/diffformer-light.png" media="(prefers-color-scheme: light)">
     <img src="assets/diffformer_light.png" alt="Diffformer Logo" width="300">
   </picture>
 </p>
