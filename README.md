@@ -8,6 +8,9 @@
 
 Diffformer is a diffusion-based language model that predicts tokens by denoising in embedding space. Instead of directly predicting and autoregressing logits, Diffformer gradually refines the pre-logit embeddings before projecting to logits and sampling.
 
+## Architecture
+
+![alt text](assets/architecture.svg)
 
 
 ---
