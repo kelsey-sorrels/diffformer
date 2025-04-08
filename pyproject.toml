@@ -1,0 +1,14 @@
+[project]
+name = "diffformer"
+version = "0.1.0"
+description = "Diffusion-based transformer model for language modeling"
+authors = [{ name = "Kelsey Sorrels", email = "kelsey.d.sorrels+diffformer@gmail.com" }]
+dependencies = [
+    "torch>=2.1.0",
+    "matplotlib",
+    "nltk",
+    "ptflops"
+]
+
+[tool.pdm]
+packages = [{ include = "diffformer" }]
