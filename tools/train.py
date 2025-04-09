@@ -15,10 +15,75 @@ default_ce_scale = 10.0
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# For TinyShakespeare.
-train_data = torch.tensor(tokenizer.encode(text, add_special_tokens=False), dtype=torch.long)
-val_data = train_data
+import os
+import torch
 
+# Hyperparameters
+BATCH_SIZE = 32
+BLOCK_SIZE = 128  # total tokens per chunk (input+target); adjust as needed
+
+def load_data(dataset_dir, dataset_name, split):
+    """
+    Loads the saved torch tensor from the given dataset directory.
+    Expected file names are '<split>.pt' (e.g. train.pt or val.pt).
+    """
+    path = os.path.join(os.path.expanduser(dataset_dir), dataset_name, f"{split}.pt")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Expected file not found: {path}")
+    data = torch.load(path)
+    return data
+
+def create_chunks(data, block_size):
+    """
+    Splits the long tokenized tensor into smaller fixed-size chunks.
+    Since we want to create input-target pairs (i.e. shifted by one token),
+    each chunk here is of length block_size and will later be split into
+    input (first block_size-1 tokens) and target (last block_size-1 tokens).
+    """
+    chunks = []
+    # Step in block_size tokens; you could also use a sliding window if you prefer overlap.
+    for i in range(0, len(data) - block_size, block_size):
+        chunk = data[i : i + block_size]
+        chunks.append(chunk)
+    return chunks
+
+def split_input_target(chunk):
+    """
+    Given a chunk (a tensor of tokens), return a tuple of
+    (input_sequence, target_sequence) where target is the input shifted by one token.
+    """
+    return chunk[:-1], chunk[1:]
+
+class LanguageModelingDataset(torch.utils.data.Dataset):
+    def __init__(self, chunks):
+        # Convert each chunk into an (input, target) pair.
+        # Note: This computes the pairs on initialization; alternatively, you could
+        # compute it on the fly in __getitem__ if memory is a concern.
+        self.input_target_pairs = [split_input_target(chunk) for chunk in chunks]
+
+    def __len__(self):
+        return len(self.input_target_pairs)
+
+    def __getitem__(self, idx):
+        x, y = self.input_target_pairs[idx]
+        # Converting the segments to tensor with long type. (They might already be tensors,
+        # but this ensures correct dtype if using lists or numpy arrays.)
+        return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
+
+
+# Configuration: Adjust these variables or expose them as arguments if needed.
+DATASET_DIR = "~/.diffformer/datasets"
+DATASET_NAME = "shakespeare"  # or 'rocstories' or 'openwebtext'
+
+# Load previously saved tokenized data
+train_data = load_data(DATASET_DIR, DATASET_NAME, "train")
+val_data = load_data(DATASET_DIR, DATASET_NAME, "val")
+
+# Create fixed-size chunks from the loaded tensors.
+train_chunks = create_chunks(train_data, BLOCK_SIZE)
+val_chunks = create_chunks(val_data, BLOCK_SIZE)
+
+  
 def get_batch(split):
     data = train_data if split == "train" else val_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
