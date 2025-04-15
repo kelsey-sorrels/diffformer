@@ -1,12 +1,12 @@
 <p align="center">
   <picture>
-    <source srcset="assets/diffformer-dark.png" media="(prefers-color-scheme: dark)">
-    <source srcset="assets/diffformer-light.png" media="(prefers-color-scheme: light)">
-    <img src="assets/diffformer_dark.png" alt="Diffformer Logo" width="300">
+    <source srcset="assets/flowformer-dark.png" media="(prefers-color-scheme: dark)">
+    <source srcset="assets/flowformer-light.png" media="(prefers-color-scheme: light)">
+    <img src="assets/flowformer_dark.png" alt="Flowformer Logo" width="300">
   </picture>
 </p>
 
-Diffformer is a diffusion-based language model that predicts tokens by denoising in embedding space. Instead of directly predicting and autoregressing logits, Diffformer gradually refines the pre-logit embeddings before projecting to logits and sampling.
+Flowformer is a flow matching-based language model that predicts tokens by integrating in embedding space. Instead of directly predicting and autoregressing logits, Diffformer gradually refines the pre-logit embeddings before projecting to logits and sampling.
 
 ## Architecture
 
