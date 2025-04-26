@@ -1,226 +1,253 @@
-
-##############################
-# Training Script (Original Training and Loss Logging)
-##############################
-
-# Training parameters.
-batch_size = 128
-block_size = 100
-max_iters = 5000
-eval_interval = 500
-eval_iters = 32
-# These parameters will be varied in the hyperparameter grid below.
-default_lr = 3e-4  
-default_ce_scale = 10.0
-
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
 import os
+import argparse
+import json
 import torch
+import logging
+from termcolor import colored
+from transformers import AutoTokenizer
+import torch.nn.functional as F
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+from torchviz import make_dot
 
-# Hyperparameters
-BATCH_SIZE = 32
-BLOCK_SIZE = 128  # total tokens per chunk (input+target); adjust as needed
+from flowformer.model import FlowTransformer
 
+# ---------------------------
+# Custom pdm–style logging
+# ---------------------------
+class PDMLoggerFormatter(logging.Formatter):
+    COLORS = {
+        "DEBUG": "blue",
+        "INFO": "green",
+        "WARNING": "yellow",
+        "ERROR": "red",
+        "CRITICAL": "red",
+    }
+    ICONS = {
+        "DEBUG": "🐞",
+        "INFO": "✔",
+        "WARNING": "⚠",
+        "ERROR": "✖",
+        "CRITICAL": "‼",
+    }
+
+    def format(self, record):
+        color = self.COLORS.get(record.levelname, "white")
+        icon = self.ICONS.get(record.levelname, "")
+        message = super().format(record)
+        return colored(f"{icon} {message}", color)
+
+logger = logging.getLogger("diffformer")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+handler.setFormatter(PDMLoggerFormatter("[%(levelname)s] %(message)s"))
+logger.addHandler(handler)
+
+# ---------------------------
+# Globals and device
+# ---------------------------
+torch.set_float32_matmul_precision('high')
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+# Globals that will be set during training/loading
+train_data = None
+val_data = None
+m = None
+ce_scale_global = 0.2
+# Will hold vocab size based on token vs char level
+dataset_vocab_size = None
+
+# ---------------------------
+# Data loading and sampling
+# ---------------------------
 def load_data(dataset_dir, dataset_name, split):
-    """
-    Loads the saved torch tensor from the given dataset directory.
-    Expected file names are '<split>.pt' (e.g. train.pt or val.pt).
-    """
     path = os.path.join(os.path.expanduser(dataset_dir), dataset_name, f"{split}.pt")
     if not os.path.exists(path):
         raise FileNotFoundError(f"Expected file not found: {path}")
-    data = torch.load(path)
-    return data
-
-def create_chunks(data, block_size):
-    """
-    Splits the long tokenized tensor into smaller fixed-size chunks.
-    Since we want to create input-target pairs (i.e. shifted by one token),
-    each chunk here is of length block_size and will later be split into
-    input (first block_size-1 tokens) and target (last block_size-1 tokens).
-    """
-    chunks = []
-    # Step in block_size tokens; you could also use a sliding window if you prefer overlap.
-    for i in range(0, len(data) - block_size, block_size):
-        chunk = data[i : i + block_size]
-        chunks.append(chunk)
-    return chunks
-
-def split_input_target(chunk):
-    """
-    Given a chunk (a tensor of tokens), return a tuple of
-    (input_sequence, target_sequence) where target is the input shifted by one token.
-    """
-    return chunk[:-1], chunk[1:]
-
-class LanguageModelingDataset(torch.utils.data.Dataset):
-    def __init__(self, chunks):
-        # Convert each chunk into an (input, target) pair.
-        # Note: This computes the pairs on initialization; alternatively, you could
-        # compute it on the fly in __getitem__ if memory is a concern.
-        self.input_target_pairs = [split_input_target(chunk) for chunk in chunks]
-
-    def __len__(self):
-        return len(self.input_target_pairs)
-
-    def __getitem__(self, idx):
-        x, y = self.input_target_pairs[idx]
-        # Converting the segments to tensor with long type. (They might already be tensors,
-        # but this ensures correct dtype if using lists or numpy arrays.)
-        return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
+    return torch.load(path)
 
 
-# Configuration: Adjust these variables or expose them as arguments if needed.
-DATASET_DIR = "~/.diffformer/datasets"
-DATASET_NAME = "shakespeare"  # or 'rocstories' or 'openwebtext'
-
-# Load previously saved tokenized data
-train_data = load_data(DATASET_DIR, DATASET_NAME, "train")
-val_data = load_data(DATASET_DIR, DATASET_NAME, "val")
-
-# Create fixed-size chunks from the loaded tensors.
-train_chunks = create_chunks(train_data, BLOCK_SIZE)
-val_chunks = create_chunks(val_data, BLOCK_SIZE)
-
-  
-def get_batch(split):
+def get_batch(split, batch_size, block_size):
+    global train_data, val_data
     data = train_data if split == "train" else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([data[i:i+block_size] for i in ix])
-    y = torch.stack([data[i+1:i+block_size+1] for i in ix])[:, -1]
+    ix = torch.randint(0, len(data) - block_size, (batch_size,))
+    x = torch.stack([data[i : i + block_size] for i in ix])
+    y = torch.stack([data[i + 1 : i + block_size + 1] for i in ix])[:, -1]
     return x.to(device), y.to(device)
 
-optimizer = None  # will be created in train_model.
 
-def compute_loss(prefix, target, noise_fn=torch.randn):
+def get_alpha_bar_and_dot(model, t):
+    T = model.num_timesteps
+    t_scaled = t * (T - 1)
+    t0 = t_scaled.floor().long().clamp(max=T - 2)
+    t1 = t0 + 1
+    frac = (t_scaled - t0.float()).unsqueeze(1)
+    a0 = model.alphas_bar[t0].view(-1,1)
+    a1 = model.alphas_bar[t1].view(-1,1)
+    alpha_bar_t = a0 + frac * (a1 - a0)
+    d_alpha_bar = (a1 - a0) * (T - 1)
+    return alpha_bar_t.clamp(min=1e-8), d_alpha_bar
+
+# ---------------------------
+# Loss and evaluation
+# ---------------------------
+def compute_loss(prefix, target, ce_scale_global=1.0):
     B = prefix.size(0)
-    clean_emb = m.token_embedding(target)  # (B, d_model)
-    noise = noise_fn(B, m.d_model, device=device)
-    t = torch.randint(0, m.num_timesteps, (B,), device=device)
-    alpha_bar_t = m.alphas_bar[t].view(B, 1)
-    noisy_emb = torch.sqrt(alpha_bar_t) * clean_emb + torch.sqrt(1 - alpha_bar_t) * noise
-    _, mse_loss, ce_loss = m(prefix, t, noisy_emb=noisy_emb, noise=noise, targets=target)
-    return mse_loss, ce_loss
+    t = torch.rand(B, device=prefix.device)  # [B]
 
-def estimate_loss():
-    losses = {"train": {"total": 0, "mse": 0, "ce": 0},
-              "val": {"total": 0, "mse": 0, "ce": 0}}
+    # Sample noise in latent space
+    noise = torch.randn(B, m.d_model, device=prefix.device)
+
+    # Embed target tokens to latent space
+    x0 = m.token_embedding(target)  # [B, d_model]
+
+    # Diffusion schedule
+    alpha_bar_t = torch.cos((t + 0.008) / (1 + 0.008) * torch.pi / 2) ** 2  # [B]
+    alpha_bar_t = alpha_bar_t / alpha_bar_t[0]  # normalize to 1 at t=0
+    d_alpha_bar = -torch.pi / 2 * torch.sin(torch.pi * t / (2 * (1 + 0.008))) / (1 + 0.008)  # [B]
+
+    # Interpolate in latent space
+    sqrt_ab = alpha_bar_t.sqrt().unsqueeze(1)      # [B, 1]
+    sqrt_1mab = (1 - alpha_bar_t).sqrt().unsqueeze(1)  # [B, 1]
+    x_t = sqrt_ab * x0 + sqrt_1mab * noise          # [B, d_model]
+
+    logits = m(prefix, t, x_t)  # [B, d_model], [B, vocab]
+
+    # Token prediction loss
+    loss = F.cross_entropy(logits, target)       # scalar
+    return loss
+
+def estimate_loss(batch_size, block_size, eval_iters):
+    losses = {split: 0.0 for split in ["train", "val"]}
     m.eval()
-    for split in ["train", "val"]:
-        total_loss_vals = torch.zeros(eval_iters, device=device)
-        mse_loss_vals = torch.zeros(eval_iters, device=device)
-        ce_loss_vals = torch.zeros(eval_iters, device=device)
-        with torch.no_grad():
-            for k in range(eval_iters):
-                X, y = get_batch(split)
-                mse_loss, ce_loss = compute_loss(X, y)
-                total_loss_vals[k] = (mse_loss + ce_loss / default_ce_scale).item()
-                mse_loss_vals[k] = mse_loss.item()
-                ce_loss_vals[k] = ce_loss.item()
-        losses[split]["total"] = total_loss_vals.mean().item()
-        losses[split]["mse"] = mse_loss_vals.mean().item()
-        losses[split]["ce"] = ce_loss_vals.mean().item()
+    with torch.no_grad():
+        for split in ["train", "val"]:
+            vals = []
+            for _ in range(eval_iters):
+                X, y = get_batch(split, batch_size, block_size)
+                loss = compute_loss(X, y)
+                vals.append(loss.item())
+            losses[split] = sum(vals) / len(vals)
     m.train()
     return losses
 
-# Logging lists.
-train_steps = []
-train_total_history = []
-train_mse_history = []
-train_ce_history = []
-val_steps = []
-val_total_history = []
-val_mse_history = []
-val_ce_history = []
-
-##############################
-# Training Loop Function (for one set of hyperparameters)
-##############################
-
-def train_model(lr, ce_scale, max_iterations):
-    global m, optimizer, default_ce_scale
-    # Reinitialize the diffusion model for a fair comparison.
-    model = DiffusionTransformer(
-        vocab_size=len(tokenizer),
-        d_model=96,
+# ---------------------------
+# Training loop
+# ---------------------------
+def train_model(lr, max_iters, batch_size, block_size, eval_interval, eval_iters):
+    global m
+    warmup_steps = 500
+    model = FlowTransformer(
+        vocab_size=dataset_vocab_size,
+        d_model=3 * 32,
         num_layers=3,
         num_heads=6,
-        block_size=128,
-        param_mode="epsilon"
+        block_size=block_size,
     )
-    # Move to device and compile.
-    m_local = model.to(device)
-    m_local = torch.compile(m_local)
-    # Use provided lr.
-    optimizer_local = torch.optim.AdamW(m_local.parameters(), lr=lr)
+    m = model.to(device)
+    # visualize once
+    X, y = get_batch("train", batch_size, block_size)
+    loss = compute_loss(X, y)
+    dot = make_dot(loss, params=dict(m.named_parameters()))
+    dot.render("grad_graph", format="png")
+    try:
+        m = torch.compile(m)
+    except Exception as e:
+        logger.warning("torch.compile failed: %s", e)
+    optimizer = torch.optim.AdamW(m.parameters(), lr=lr)
+    warmup_sched = LinearLR(optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps)
+    cosine_sched = CosineAnnealingLR(optimizer, T_max=max_iters - warmup_steps, eta_min=0.0)
+    scheduler = SequentialLR(optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_steps])
 
-    # Reset logging lists.
-    local_train_steps, local_train_total, local_train_mse, local_train_ce = [], [], [], []
-    local_val_steps, local_val_total, local_val_mse, local_val_ce = [], [], [], []
-
-    # Use the given ce_scale for this run.
-    default_ce_scale = ce_scale
-
-    for step in range(max_iterations):
-        if step % eval_interval == 0 or step == max_iterations - 1:
-            losses = estimate_loss()
-            print(f"[lr={lr}, ce_scale={ce_scale}] step {step}: train loss {losses['train']['total']:.4f} (mse: {losses['train']['mse']:.4f}, ce: {losses['train']['ce']:.4f}), "
-                  f"val loss {losses['val']['total']:.4f} (mse: {losses['val']['mse']:.4f}, ce: {losses['val']['ce']:.4f})")
-            local_val_steps.append(step)
-            local_val_total.append(losses["val"]["total"])
-            local_val_mse.append(losses["val"]["mse"])
-            local_val_ce.append(losses["val"]["ce"])
-        
-        X, y = get_batch("train")
-        mse_loss, ce_loss = compute_loss(X, y)
-        loss = mse_loss + ce_loss / ce_scale
-
-        optimizer_local.zero_grad(set_to_none=True)
+    for step in range(max_iters):
+        if step % eval_interval == 0 or step == max_iters - 1:
+            lr_now = scheduler.get_last_lr()[0]
+            stats = estimate_loss(batch_size, block_size, eval_iters)
+            logger.info(f"[lr={lr_now:.2e}] step {step}: train {stats['train']:.4f}, val {stats['val']:.4f}")
+        X, y = get_batch("train", batch_size, block_size)
+        loss = compute_loss(X, y)
+        optimizer.zero_grad()
         loss.backward()
-        optimizer_local.step()
+        optimizer.step()
+        scheduler.step()
 
-        local_train_steps.append(step)
-        local_train_total.append(loss.item())
-        local_train_mse.append(mse_loss.item())
-        local_train_ce.append(ce_loss.item())
-
-    # Final evaluation.
     with torch.no_grad():
-        X_val, y_val = get_batch("val")
-        mse_loss, ce_loss = compute_loss(X_val, y_val)
-        final_loss = mse_loss + ce_loss / ce_scale
-        print(f"[lr={lr}, ce_scale={ce_scale}] Final Eval Loss: {final_loss.item():.4f} "
-              f"(mse: {mse_loss.item():.4f}, ce: {ce_loss.item():.4f})")
-    return {
-        "final_loss": final_loss.item(),
-        "train_steps": local_train_steps,
-        "train_total": local_train_total,
-        "train_mse": local_train_mse,
-        "train_ce": local_train_ce,
-        "val_steps": local_val_steps,
-        "val_total": local_val_total,
-        "val_mse": local_val_mse,
-        "val_ce": local_val_ce,
-    }
+        X_val, y_val = get_batch("val", batch_size, block_size)
+        final_loss, _, _ = compute_loss(X_val, y_val)
+        logger.info(f"Final Eval Loss: {final_loss.item():.4f}")
+    return final_loss.item()
 
-##############################
-# Hyperparameter Grid Search
-##############################
+# ---------------------------
+# Main entry-point
+# ---------------------------
+def main():
+    parser = argparse.ArgumentParser(
+        description="Train FlowTransformer on token or character data.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument("--dataset-dir", type=str, default="~/.diffformer/datasets",
+                        help="Directory containing processed datasets.")
+    parser.add_argument("--dataset-name", type=str, default="shakespeare",
+                        choices=["shakespeare", "rocstories", "openwebtext"],
+                        help="Base name of the dataset.")
+    parser.add_argument("--char-level", action="store_true",
+                        help="Train on character-level dataset instead of token-level.")
+    parser.add_argument("--batch-size", type=int, default=128, help="Batch size.")
+    parser.add_argument("--block-size", type=int, default=100, help="Sequence length.")
+    parser.add_argument("--max-iters", type=int, default=1000, help="Training iterations.")
+    parser.add_argument("--eval-interval", type=int, default=500, help="Eval every N steps.")
+    parser.add_argument("--eval-iters", type=int, default=32, help="Iters for eval averaging.")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
+    parser.add_argument("--hp-search", action="store_true",
+                        help="Perform hyperparam grid search instead of single run.")
+    parser.add_argument("--model-dir", type=str, default="~/.diffformer/models",
+                        help="Where to save checkpoints.")
+    args = parser.parse_args()
 
-candidate_lrs = [1e-4, 3e-4, 1e-3]
-candidate_ce_scales = [5.0, 10.0, 20.0]
-results = {}
+    global train_data, val_data, dataset_vocab_size
+    # Determine dataset folder & vocab size
+    suffix = "_char" if args.char_level else "_token"
+    folder = f"{args.dataset_name}{suffix}"
+    data_path = os.path.expanduser(args.dataset_dir)
+    if args.char_level:
+        mapping_file = os.path.join(data_path, folder, "char2idx.json")
+        with open(mapping_file, 'r') as f:
+            char2idx = json.load(f)
+        dataset_vocab_size = len(char2idx)
+        logger.info(f"Using character-level data from '{folder}' with vocab size {dataset_vocab_size}")
+    else:
+        dataset_vocab_size = len(tokenizer)
+        logger.info(f"Using token-level data from '{folder}' with vocab size {dataset_vocab_size}")
 
-# To save time, you might run a shorter training run when sweeping hyperparameters.
-grid_max_iters = 1000  
+    # Load data splits
+    logger.info("Loading training data...")
+    train_data = load_data(args.dataset_dir, folder, "train")
+    logger.info("Loading validation data...")
+    val_data = load_data(args.dataset_dir, folder, "val")
 
-for lr in candidate_lrs:
-    for ce_scale in candidate_ce_scales:
-        print(f"==> Training with lr = {lr}, ce_loss_scale = {ce_scale}")
-        res = train_model(lr, ce_scale, grid_max_iters)
-        results[(lr, ce_scale)] = res["final_loss"]
+    if args.hp_search:
+        # grid search
+        lrs = [1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2]
+        results = {}
+        logger.info("Starting hyperparameter grid search...")
+        for lr in lrs:
+            logger.info(f"Testing lr={lr}")
+            loss = train_model(lr, 1500, args.batch_size, args.block_size,
+                               args.eval_interval, args.eval_iters)
+            results[lr] = loss
+        best = min(results, key=results.get)
+        logger.info(f"Best LR: {best} -> loss {results[best]:.4f}")
+    else:
+        logger.info("Starting training...")
+        final = train_model(args.lr, args.max_iters, args.batch_size,
+                             args.block_size, args.eval_interval, args.eval_iters)
+        logger.info("Training complete.")
+        # Save checkpoint
+        path = os.path.expanduser(args.model_dir)
+        os.makedirs(path, exist_ok=True)
+        ckpt = os.path.join(path, "model_checkpoint.pt")
+        torch.save({'model_state_dict': m.state_dict(), 'args': vars(args)}, ckpt)
+        logger.info(f"Saved checkpoint to {ckpt}")
 
-print("Hyperparameter grid search results:")
-for (lr, ce_scale), final_loss in results.items():
-    print(f"lr: {lr}, ce_loss_scale: {ce_scale} -> final val loss: {final_loss:.4f}")
+if __name__ == "__main__":
+    main()
